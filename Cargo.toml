@@ -1,0 +1,13 @@
+[package]
+name = "yaml-layers"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Parse and merge a deterministic subset of YAML for layered config files"
+authors = ["daniely81"]
+
+[lib]
+name = "yaml_layers"
+path = "src/lib.rs"
+
+[dependencies]
