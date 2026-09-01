@@ -59,6 +59,8 @@ way to merge a list.
 ## Supported YAML
 
 - block mappings and block sequences, indented with spaces
+- inline `- key: value` sequence items, with the mapping continuing on
+  following lines aligned under `key`
 - scalars: strings (quoted or bare), integers, floats, booleans, null
 - single- and double-quoted strings, with `\n`, `\t`, `\"`, `\\` escapes
   in double-quoted strings and `''` as an escaped quote in single-quoted
@@ -71,8 +73,6 @@ parse error, not a guess:
 - flow collections (`[a, b]`, `{k: v}`)
 - anchors, aliases, and tags
 - multi-document streams (`---`)
-- inline `- key: value` sequence items (use a `-` on its own line with an
-  indented mapping under it instead)
 
 ## Layout
 

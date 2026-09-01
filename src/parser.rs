@@ -26,9 +26,9 @@ struct Line<'a> {
 /// block sequences, quoted and unquoted scalars, and `#` comments.
 ///
 /// Not supported yet: flow collections (`[a, b]`, `{k: v}`), anchors and
-/// aliases, multi-document streams, and inline `- key: value` sequence
-/// items. The top-level document must be a mapping or a sequence, since
-/// that covers every real config file this library has been used for.
+/// aliases, and multi-document streams. The top-level document must be a
+/// mapping or a sequence, since that covers every real config file this
+/// library has been used for.
 pub fn parse(input: &str) -> Result<Value, ParseError> {
     let lines = preprocess(input);
     if lines.is_empty() {
@@ -112,12 +112,43 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Valu
                 pos = next_pos;
             }
         } else {
-            let rest = content[1..].trim_start();
-            items.push(parse_scalar(rest));
-            pos += 1;
+            let after_dash = &content[1..];
+            let leading_spaces = after_dash.len() - after_dash.trim_start().len();
+            let rest = &after_dash[leading_spaces..];
+            let rest_indent = indent + 1 + leading_spaces;
+            if find_key_separator(rest).is_some() {
+                let (value, np) = parse_inline_mapping_item(lines, pos, rest, rest_indent)?;
+                items.push(value);
+                pos = np;
+            } else {
+                items.push(parse_scalar(rest));
+                pos += 1;
+            }
         }
     }
     Ok((Value::Sequence(items), pos))
+}
+
+/// Parses a `- key: value` sequence item, whose mapping may continue onto
+/// following lines indented to line up with `key` (the column right after
+/// `- `), the same way real YAML aligns an inline mapping under a dash.
+fn parse_inline_mapping_item(
+    lines: &[Line],
+    pos: usize,
+    first_line_rest: &str,
+    rest_indent: usize,
+) -> Result<(Value, usize), ParseError> {
+    let mut end = pos + 1;
+    while end < lines.len() && lines[end].indent >= rest_indent {
+        end += 1;
+    }
+    let mut synthetic: Vec<Line> = Vec::with_capacity(end - pos);
+    synthetic.push(Line { indent: rest_indent, content: first_line_rest, number: lines[pos].number });
+    for l in &lines[pos + 1..end] {
+        synthetic.push(Line { indent: l.indent, content: l.content, number: l.number });
+    }
+    let (value, consumed) = parse_mapping(&synthetic, 0, rest_indent)?;
+    Ok((value, pos + consumed))
 }
 
 fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value, usize), ParseError> {
@@ -262,6 +293,36 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].get("host"), Some(&Value::String("a".to_string())));
         assert_eq!(servers[1].get("port"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn parses_inline_mapping_sequence_item() {
+        let input = "servers:\n  - host: a\n    port: 1\n  - host: b\n    port: 2\n";
+        let value = parse(input).unwrap();
+        let servers = value.get("servers").unwrap().as_sequence().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].get("host"), Some(&Value::String("a".to_string())));
+        assert_eq!(servers[0].get("port"), Some(&Value::Int(1)));
+        assert_eq!(servers[1].get("host"), Some(&Value::String("b".to_string())));
+        assert_eq!(servers[1].get("port"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn inline_mapping_sequence_item_with_single_key() {
+        let value = parse("names:\n  - first: alice\n  - first: bob\n").unwrap();
+        let names = value.get("names").unwrap().as_sequence().unwrap();
+        assert_eq!(names[0].get("first"), Some(&Value::String("alice".to_string())));
+        assert_eq!(names[1].get("first"), Some(&Value::String("bob".to_string())));
+    }
+
+    #[test]
+    fn inline_mapping_sequence_item_with_nested_block() {
+        let input = "items:\n  - name: a\n    meta:\n      owner: x\n  - name: b\n";
+        let value = parse(input).unwrap();
+        let items = value.get("items").unwrap().as_sequence().unwrap();
+        assert_eq!(items[0].get("name"), Some(&Value::String("a".to_string())));
+        assert_eq!(items[0].path("meta.owner"), Some(&Value::String("x".to_string())));
+        assert_eq!(items[1].get("name"), Some(&Value::String("b".to_string())));
     }
 
     #[test]
