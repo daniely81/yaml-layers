@@ -61,6 +61,9 @@ way to merge a list.
 - block mappings and block sequences, indented with spaces
 - inline `- key: value` sequence items, with the mapping continuing on
   following lines aligned under `key`
+- flow collections, `[a, b, c]` and `{k: v, k2: v2}`, including nested
+  ones like `[{k: v}, [1, 2]]` - each flow collection must fit on a
+  single line
 - scalars: strings (quoted or bare), integers, floats, booleans, null
 - single- and double-quoted strings, with `\n`, `\t`, `\"`, `\\` escapes
   in double-quoted strings and `''` as an escaped quote in single-quoted
@@ -70,7 +73,6 @@ way to merge a list.
 Not supported yet, and not silently mangled - unrecognized syntax is a
 parse error, not a guess:
 
-- flow collections (`[a, b]`, `{k: v}`)
 - anchors, aliases, and tags
 - multi-document streams (`---`)
 

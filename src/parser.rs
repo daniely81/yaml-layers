@@ -23,12 +23,13 @@ struct Line<'a> {
 }
 
 /// Parses a restricted, deterministic subset of YAML: block mappings,
-/// block sequences, quoted and unquoted scalars, and `#` comments.
+/// block sequences, flow collections, quoted and unquoted scalars, and
+/// `#` comments.
 ///
-/// Not supported yet: flow collections (`[a, b]`, `{k: v}`), anchors and
-/// aliases, and multi-document streams. The top-level document must be a
-/// mapping or a sequence, since that covers every real config file this
-/// library has been used for.
+/// Not supported yet: anchors and aliases, and multi-document streams.
+/// The top-level document must be a block mapping or a block sequence,
+/// since that covers every real config file this library has been used
+/// for.
 pub fn parse(input: &str) -> Result<Value, ParseError> {
     let lines = preprocess(input);
     if lines.is_empty() {
@@ -121,7 +122,7 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Valu
                 items.push(value);
                 pos = np;
             } else {
-                items.push(parse_scalar(rest));
+                items.push(parse_scalar(rest, lines[pos].number)?);
                 pos += 1;
             }
         }
@@ -173,7 +174,7 @@ fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value
                 pos = next_pos;
             }
         } else {
-            entries.push((key, parse_scalar(rest)));
+            entries.push((key, parse_scalar(rest, lines[pos].number)?));
             pos += 1;
         }
     }
@@ -181,17 +182,21 @@ fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value
 }
 
 /// Finds the `:` that separates a mapping key from its value: one outside
-/// quotes and followed by a space or the end of the line (so a URL like
-/// `http://x` inside a value never gets mistaken for a key separator).
+/// quotes and flow brackets, and followed by a space or the end of the
+/// line (so a URL like `http://x` inside a value, or a `k: v` pair inside
+/// a flow mapping like `{k: v}`, never gets mistaken for a key separator).
 fn find_key_separator(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
+    let mut depth: i32 = 0;
     for (i, c) in s.char_indices() {
         match c {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
-            ':' if !in_single && !in_double => {
+            '[' | '{' if !in_single && !in_double => depth += 1,
+            ']' | '}' if !in_single && !in_double => depth -= 1,
+            ':' if !in_single && !in_double && depth == 0 => {
                 let at_boundary = i + 1 == s.len() || bytes[i + 1] == b' ';
                 if at_boundary {
                     return Some(i);
@@ -207,10 +212,17 @@ fn parse_scalar_key(raw: &str) -> String {
     unquote(raw).unwrap_or_else(|| raw.to_string())
 }
 
-fn parse_scalar(raw: &str) -> Value {
-    if let Some(s) = unquote(raw) {
-        return Value::String(s);
+fn parse_scalar(raw: &str, line: usize) -> Result<Value, ParseError> {
+    if raw.starts_with('[') || raw.starts_with('{') {
+        return parse_flow(raw, line);
     }
+    if let Some(s) = unquote(raw) {
+        return Ok(Value::String(s));
+    }
+    Ok(scalar_from_keyword_or_number(raw))
+}
+
+fn scalar_from_keyword_or_number(raw: &str) -> Value {
     match raw {
         "" | "~" | "null" | "Null" | "NULL" => return Value::Null,
         "true" | "True" | "TRUE" => return Value::Bool(true),
@@ -224,6 +236,174 @@ fn parse_scalar(raw: &str) -> Value {
         return Value::Float(f);
     }
     Value::String(raw.to_string())
+}
+
+/// Parses a `[a, b]` flow sequence or `{k: v}` flow mapping. These are
+/// confined to a single logical line - there is no continuation across
+/// lines - which keeps the parser a simple cursor over `raw`'s characters
+/// instead of needing to look ahead into the line list.
+fn parse_flow(raw: &str, line: usize) -> Result<Value, ParseError> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut pos = 0;
+    let value = parse_flow_value(&chars, &mut pos, line)?;
+    skip_flow_ws(&chars, &mut pos);
+    if pos != chars.len() {
+        let rest: String = chars[pos..].iter().collect();
+        return Err(ParseError { line, message: format!("unexpected trailing content '{}' after flow value", rest) });
+    }
+    Ok(value)
+}
+
+fn skip_flow_ws(chars: &[char], pos: &mut usize) {
+    while *pos < chars.len() && chars[*pos].is_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn parse_flow_value(chars: &[char], pos: &mut usize, line: usize) -> Result<Value, ParseError> {
+    skip_flow_ws(chars, pos);
+    match chars.get(*pos).copied() {
+        Some('[') => parse_flow_sequence(chars, pos, line),
+        Some('{') => parse_flow_mapping(chars, pos, line),
+        Some('"') | Some('\'') => Ok(Value::String(parse_flow_quoted(chars, pos, line)?)),
+        Some(_) => {
+            let token = read_flow_token(chars, pos);
+            if token.is_empty() {
+                return Err(ParseError { line, message: "expected a value in flow collection".to_string() });
+            }
+            Ok(scalar_from_keyword_or_number(&token))
+        }
+        None => Err(ParseError { line, message: "expected a value but found end of input".to_string() }),
+    }
+}
+
+/// Reads a bare (unquoted) flow scalar up to the next `,`, `]`, or `}`.
+fn read_flow_token(chars: &[char], pos: &mut usize) -> String {
+    let start = *pos;
+    while *pos < chars.len() && !matches!(chars[*pos], ',' | ']' | '}') {
+        *pos += 1;
+    }
+    chars[start..*pos].iter().collect::<String>().trim().to_string()
+}
+
+fn parse_flow_quoted(chars: &[char], pos: &mut usize, line: usize) -> Result<String, ParseError> {
+    let quote = chars[*pos];
+    *pos += 1;
+    let mut out = String::new();
+    loop {
+        match chars.get(*pos).copied() {
+            None => return Err(ParseError { line, message: "unterminated quoted string in flow value".to_string() }),
+            Some(c) if c == quote => {
+                *pos += 1;
+                if quote == '\'' && chars.get(*pos).copied() == Some('\'') {
+                    out.push('\'');
+                    *pos += 1;
+                    continue;
+                }
+                break;
+            }
+            Some('\\') if quote == '"' => {
+                *pos += 1;
+                match chars.get(*pos).copied() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+                *pos += 1;
+            }
+            Some(c) => {
+                out.push(c);
+                *pos += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_flow_sequence(chars: &[char], pos: &mut usize, line: usize) -> Result<Value, ParseError> {
+    *pos += 1; // consume '['
+    let mut items = Vec::new();
+    skip_flow_ws(chars, pos);
+    if chars.get(*pos).copied() == Some(']') {
+        *pos += 1;
+        return Ok(Value::Sequence(items));
+    }
+    loop {
+        items.push(parse_flow_value(chars, pos, line)?);
+        skip_flow_ws(chars, pos);
+        match chars.get(*pos).copied() {
+            Some(',') => {
+                *pos += 1;
+                skip_flow_ws(chars, pos);
+                if chars.get(*pos).copied() == Some(']') {
+                    *pos += 1;
+                    break;
+                }
+            }
+            Some(']') => {
+                *pos += 1;
+                break;
+            }
+            _ => return Err(ParseError { line, message: "expected ',' or ']' in flow sequence".to_string() }),
+        }
+    }
+    Ok(Value::Sequence(items))
+}
+
+fn parse_flow_mapping(chars: &[char], pos: &mut usize, line: usize) -> Result<Value, ParseError> {
+    *pos += 1; // consume '{'
+    let mut entries: Vec<(String, Value)> = Vec::new();
+    skip_flow_ws(chars, pos);
+    if chars.get(*pos).copied() == Some('}') {
+        *pos += 1;
+        return Ok(Value::Mapping(entries));
+    }
+    loop {
+        skip_flow_ws(chars, pos);
+        let key = match chars.get(*pos).copied() {
+            Some('"') | Some('\'') => parse_flow_quoted(chars, pos, line)?,
+            _ => {
+                let start = *pos;
+                while *pos < chars.len() && chars[*pos] != ':' {
+                    *pos += 1;
+                }
+                if *pos >= chars.len() {
+                    return Err(ParseError { line, message: "expected ':' in flow mapping entry".to_string() });
+                }
+                chars[start..*pos].iter().collect::<String>().trim().to_string()
+            }
+        };
+        skip_flow_ws(chars, pos);
+        if chars.get(*pos).copied() != Some(':') {
+            return Err(ParseError { line, message: "expected ':' after key in flow mapping".to_string() });
+        }
+        *pos += 1;
+        let value = parse_flow_value(chars, pos, line)?;
+        entries.push((key, value));
+        skip_flow_ws(chars, pos);
+        match chars.get(*pos).copied() {
+            Some(',') => {
+                *pos += 1;
+                skip_flow_ws(chars, pos);
+                if chars.get(*pos).copied() == Some('}') {
+                    *pos += 1;
+                    break;
+                }
+            }
+            Some('}') => {
+                *pos += 1;
+                break;
+            }
+            _ => return Err(ParseError { line, message: "expected ',' or '}' in flow mapping".to_string() }),
+        }
+    }
+    Ok(Value::Mapping(entries))
 }
 
 fn unquote(raw: &str) -> Option<String> {
@@ -375,5 +555,73 @@ mod tests {
     fn empty_document_is_null() {
         assert_eq!(parse("").unwrap(), Value::Null);
         assert_eq!(parse("\n\n# just a comment\n").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn parses_flow_sequence_of_scalars() {
+        let value = parse("tags: [alpha, beta, 3]\n").unwrap();
+        let tags = value.get("tags").unwrap().as_sequence().unwrap();
+        assert_eq!(
+            tags,
+            &[Value::String("alpha".to_string()), Value::String("beta".to_string()), Value::Int(3)]
+        );
+    }
+
+    #[test]
+    fn parses_empty_flow_collections() {
+        let value = parse("a: []\nb: {}\n").unwrap();
+        assert_eq!(value.get("a"), Some(&Value::Sequence(vec![])));
+        assert_eq!(value.get("b"), Some(&Value::Mapping(vec![])));
+    }
+
+    #[test]
+    fn parses_flow_mapping() {
+        let value = parse("point: {x: 1, y: 2}\n").unwrap();
+        let point = value.get("point").unwrap();
+        assert_eq!(point.get("x"), Some(&Value::Int(1)));
+        assert_eq!(point.get("y"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn parses_nested_flow_collections() {
+        let value = parse("data: [{k: v}, [1, 2]]\n").unwrap();
+        let data = value.get("data").unwrap().as_sequence().unwrap();
+        assert_eq!(data[0].get("k"), Some(&Value::String("v".to_string())));
+        assert_eq!(data[1].as_sequence(), Some(&[Value::Int(1), Value::Int(2)][..]));
+    }
+
+    #[test]
+    fn flow_collection_respects_quoted_commas_and_colons() {
+        let value = parse("tags: [\"a, b\", 'c: d']\n").unwrap();
+        let tags = value.get("tags").unwrap().as_sequence().unwrap();
+        assert_eq!(tags, &[Value::String("a, b".to_string()), Value::String("c: d".to_string())]);
+    }
+
+    #[test]
+    fn flow_sequence_as_bare_sequence_item() {
+        let value = parse("rows:\n  - [1, 2]\n  - [3, 4]\n").unwrap();
+        let rows = value.get("rows").unwrap().as_sequence().unwrap();
+        assert_eq!(rows[0].as_sequence(), Some(&[Value::Int(1), Value::Int(2)][..]));
+        assert_eq!(rows[1].as_sequence(), Some(&[Value::Int(3), Value::Int(4)][..]));
+    }
+
+    #[test]
+    fn flow_mapping_as_bare_sequence_item() {
+        let value = parse("rows:\n  - {name: a, val: 1}\n  - {name: b, val: 2}\n").unwrap();
+        let rows = value.get("rows").unwrap().as_sequence().unwrap();
+        assert_eq!(rows[0].get("name"), Some(&Value::String("a".to_string())));
+        assert_eq!(rows[1].get("val"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn unterminated_flow_sequence_is_an_error() {
+        let err = parse("tags: [a, b\n").unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn trailing_content_after_flow_value_is_an_error() {
+        let err = parse("tags: [a, b] extra\n").unwrap_err();
+        assert_eq!(err.line, 1);
     }
 }
