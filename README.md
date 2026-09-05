@@ -76,10 +76,17 @@ parse error, not a guess:
 - anchors, aliases, and tags
 - multi-document streams (`---`)
 
+`Value` also implements `Display`, so `merged.to_string()` renders a
+`Value` back to YAML text that `parse` can read again - useful for writing
+out the merged config for debugging, or diffing it against a previous
+run. Strings are quoted whenever a bare word would round-trip as a
+different type or confuse the parser (`"42"`, `"true"`, `"a: b"`).
+
 ## Layout
 
-- `src/value.rs` - the `Value` enum and read-only accessors (`get`, `path`,
-  `as_str`, ...)
+- `src/value.rs` - the `Value` enum, read-only accessors (`get`, `path`,
+  `as_str`, ...), and the `Display` impl that renders a `Value` back to
+  YAML text
 - `src/parser.rs` - `parse(&str) -> Result<Value, ParseError>`
 - `src/merge.rs` - `merge(&Value, &Value) -> Value`
 
