@@ -23,20 +23,23 @@ struct Line<'a> {
 }
 
 /// Parses a restricted, deterministic subset of YAML: block mappings,
-/// block sequences, flow collections, quoted and unquoted scalars, and
-/// `#` comments.
+/// block sequences, flow collections, quoted and unquoted scalars,
+/// `|` and `>` block scalars, and `#` comments.
 ///
-/// Not supported yet: anchors and aliases, and multi-document streams.
+/// Not supported yet: anchors and aliases, multi-document streams, and
+/// the explicit indentation indicator on a block scalar (`|2`) - the
+/// indentation is always inferred from the first content line instead.
 /// The top-level document must be a block mapping or a block sequence,
 /// since that covers every real config file this library has been used
 /// for.
 pub fn parse(input: &str) -> Result<Value, ParseError> {
+    let raw: Vec<&str> = input.lines().collect();
     let lines = preprocess(input);
     if lines.is_empty() {
         return Ok(Value::Null);
     }
     let top_indent = lines[0].indent;
-    let (value, next) = parse_block(&lines, 0, top_indent)?;
+    let (value, next) = parse_block(&lines, 0, top_indent, &raw)?;
     if next != lines.len() {
         return Err(ParseError {
             line: lines[next].number,
@@ -85,19 +88,19 @@ fn is_sequence_item(content: &str) -> bool {
     content == "-" || content.starts_with("- ")
 }
 
-fn parse_block(lines: &[Line], pos: usize, indent: usize) -> Result<(Value, usize), ParseError> {
+fn parse_block(lines: &[Line], pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
     if pos >= lines.len() || lines[pos].indent != indent {
         let line = lines.get(pos).map(|l| l.number).unwrap_or_else(|| lines.last().map(|l| l.number).unwrap_or(1));
         return Err(ParseError { line, message: "expected content at this indentation".to_string() });
     }
     if is_sequence_item(lines[pos].content) {
-        parse_sequence(lines, pos, indent)
+        parse_sequence(lines, pos, indent, raw)
     } else {
-        parse_mapping(lines, pos, indent)
+        parse_mapping(lines, pos, indent, raw)
     }
 }
 
-fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value, usize), ParseError> {
+fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
     let mut items = Vec::new();
     while pos < lines.len() && lines[pos].indent == indent && is_sequence_item(lines[pos].content) {
         let content = lines[pos].content;
@@ -105,7 +108,7 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Valu
             let next_pos = pos + 1;
             if next_pos < lines.len() && lines[next_pos].indent > indent {
                 let child_indent = lines[next_pos].indent;
-                let (value, np) = parse_block(lines, next_pos, child_indent)?;
+                let (value, np) = parse_block(lines, next_pos, child_indent, raw)?;
                 items.push(value);
                 pos = np;
             } else {
@@ -118,9 +121,16 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Valu
             let rest = &after_dash[leading_spaces..];
             let rest_indent = indent + 1 + leading_spaces;
             if find_key_separator(rest).is_some() {
-                let (value, np) = parse_inline_mapping_item(lines, pos, rest, rest_indent)?;
+                let (value, np) = parse_inline_mapping_item(lines, pos, rest, rest_indent, raw)?;
                 items.push(value);
                 pos = np;
+            } else if let Some((style, chomp)) = parse_block_indicator(rest) {
+                let (text, last_line) = read_block_scalar(raw, lines[pos].number, indent, style, chomp);
+                items.push(Value::String(text));
+                pos += 1;
+                while pos < lines.len() && lines[pos].number <= last_line {
+                    pos += 1;
+                }
             } else {
                 items.push(parse_scalar(rest, lines[pos].number)?);
                 pos += 1;
@@ -138,6 +148,7 @@ fn parse_inline_mapping_item(
     pos: usize,
     first_line_rest: &str,
     rest_indent: usize,
+    raw: &[&str],
 ) -> Result<(Value, usize), ParseError> {
     let mut end = pos + 1;
     while end < lines.len() && lines[end].indent >= rest_indent {
@@ -148,11 +159,11 @@ fn parse_inline_mapping_item(
     for l in &lines[pos + 1..end] {
         synthetic.push(Line { indent: l.indent, content: l.content, number: l.number });
     }
-    let (value, consumed) = parse_mapping(&synthetic, 0, rest_indent)?;
+    let (value, consumed) = parse_mapping(&synthetic, 0, rest_indent, raw)?;
     Ok((value, pos + consumed))
 }
 
-fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value, usize), ParseError> {
+fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
     let mut entries: Vec<(String, Value)> = Vec::new();
     while pos < lines.len() && lines[pos].indent == indent && !is_sequence_item(lines[pos].content) {
         let content = lines[pos].content;
@@ -162,11 +173,18 @@ fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize) -> Result<(Value
         })?;
         let key = parse_scalar_key(content[..separator].trim());
         let rest = content[separator + 1..].trim();
-        if rest.is_empty() {
+        if let Some((style, chomp)) = parse_block_indicator(rest) {
+            let (text, last_line) = read_block_scalar(raw, lines[pos].number, indent, style, chomp);
+            entries.push((key, Value::String(text)));
+            pos += 1;
+            while pos < lines.len() && lines[pos].number <= last_line {
+                pos += 1;
+            }
+        } else if rest.is_empty() {
             let next_pos = pos + 1;
             if next_pos < lines.len() && lines[next_pos].indent > indent {
                 let child_indent = lines[next_pos].indent;
-                let (value, np) = parse_block(lines, next_pos, child_indent)?;
+                let (value, np) = parse_block(lines, next_pos, child_indent, raw)?;
                 entries.push((key, value));
                 pos = np;
             } else {
@@ -236,6 +254,145 @@ fn scalar_from_keyword_or_number(raw: &str) -> Value {
         return Value::Float(f);
     }
     Value::String(raw.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum BlockStyle {
+    /// `|` - keep line breaks as written.
+    Literal,
+    /// `>` - fold single line breaks into spaces; blank lines stay as breaks.
+    Folded,
+}
+
+#[derive(Clone, Copy)]
+enum Chomp {
+    /// `-` - drop the trailing line break entirely.
+    Strip,
+    /// no suffix - keep exactly one trailing line break.
+    Clip,
+    /// `+` - keep every trailing blank line as written.
+    Keep,
+}
+
+/// Recognizes a block scalar header (`|`, `|-`, `|+`, `>`, `>-`, `>+`) in
+/// an already-trimmed value. Anything else, including the explicit
+/// indentation indicator (`|2`), is left for `parse_scalar` to handle as
+/// a plain string.
+fn parse_block_indicator(rest: &str) -> Option<(BlockStyle, Chomp)> {
+    let mut chars = rest.chars();
+    let style = match chars.next()? {
+        '|' => BlockStyle::Literal,
+        '>' => BlockStyle::Folded,
+        _ => return None,
+    };
+    let chomp = match chars.as_str() {
+        "" => Chomp::Clip,
+        "-" => Chomp::Strip,
+        "+" => Chomp::Keep,
+        _ => return None,
+    };
+    Some((style, chomp))
+}
+
+/// Reads a block scalar's content lines directly from the original,
+/// unprocessed source text, starting right after the `key: |` (or `- |`)
+/// line at 1-based `indicator_line_number`. Reading from `raw` instead of
+/// the preprocessed `Line` list matters here: comments are not stripped
+/// and blank lines are not dropped inside a block scalar, unlike
+/// everywhere else in this parser.
+///
+/// `parent_indent` is the indentation of the line carrying the `|`/`>`
+/// indicator; content must be indented more than that, which is how real
+/// YAML knows where the block ends. Returns the assembled string and the
+/// 1-based number of the last raw line consumed by the block (equal to
+/// `indicator_line_number` itself if the block turns out to be empty).
+fn read_block_scalar(
+    raw: &[&str],
+    indicator_line_number: usize,
+    parent_indent: usize,
+    style: BlockStyle,
+    chomp: Chomp,
+) -> (String, usize) {
+    let start = indicator_line_number; // raw is 0-indexed, so this is already "one past" the indicator line
+    let block_indent = raw[start..]
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start_matches(' ').len())
+        .filter(|indent| *indent > parent_indent);
+    let block_indent = match block_indent {
+        Some(indent) => indent,
+        None => return (String::new(), start),
+    };
+
+    let mut collected: Vec<&str> = Vec::new();
+    let mut i = start;
+    while i < raw.len() {
+        let line = raw[i];
+        if line.trim().is_empty() {
+            collected.push("");
+            i += 1;
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent < block_indent {
+            break;
+        }
+        collected.push(&line[block_indent..]);
+        i += 1;
+    }
+    let last_line = i;
+
+    let trailing_blanks = collected.iter().rev().take_while(|l| l.is_empty()).count();
+    collected.truncate(collected.len() - trailing_blanks);
+
+    let body = match style {
+        BlockStyle::Literal => collected.join("\n"),
+        BlockStyle::Folded => fold_lines(&collected),
+    };
+    (apply_chomp(body, trailing_blanks, chomp), last_line)
+}
+
+/// Folds `>`-style content: a line break between two content lines
+/// becomes a space, but a blank line still becomes a line break.
+fn fold_lines(lines: &[&str]) -> String {
+    let mut out = String::new();
+    let mut prev_was_content = false;
+    for line in lines {
+        if line.is_empty() {
+            out.push('\n');
+            prev_was_content = false;
+        } else {
+            if prev_was_content {
+                out.push(' ');
+            }
+            out.push_str(line);
+            prev_was_content = true;
+        }
+    }
+    out
+}
+
+fn apply_chomp(body: String, trailing_blanks: usize, chomp: Chomp) -> String {
+    match chomp {
+        Chomp::Strip => body,
+        Chomp::Clip => {
+            if body.is_empty() {
+                body
+            } else {
+                body + "\n"
+            }
+        }
+        Chomp::Keep => {
+            let mut out = body;
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            for _ in 0..trailing_blanks {
+                out.push('\n');
+            }
+            out
+        }
+    }
 }
 
 /// Parses a `[a, b]` flow sequence or `{k: v}` flow mapping. These are
@@ -623,5 +780,77 @@ mod tests {
     fn trailing_content_after_flow_value_is_an_error() {
         let err = parse("tags: [a, b] extra\n").unwrap_err();
         assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn literal_block_scalar_keeps_line_breaks() {
+        let value = parse("script: |\n  line one\n  line two\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String("line one\nline two\n".to_string())));
+    }
+
+    #[test]
+    fn folded_block_scalar_joins_lines_with_spaces() {
+        let value = parse("summary: >\n  line one\n  line two\n").unwrap();
+        assert_eq!(value.get("summary"), Some(&Value::String("line one line two\n".to_string())));
+    }
+
+    #[test]
+    fn folded_block_scalar_keeps_blank_line_as_break() {
+        let value = parse("summary: >\n  first para\n\n  second para\n").unwrap();
+        assert_eq!(value.get("summary"), Some(&Value::String("first para\nsecond para\n".to_string())));
+    }
+
+    #[test]
+    fn block_scalar_strip_chomping_drops_trailing_newline() {
+        let value = parse("script: |-\n  line one\n  line two\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String("line one\nline two".to_string())));
+    }
+
+    #[test]
+    fn block_scalar_keep_chomping_preserves_trailing_blank_lines() {
+        let value = parse("script: |+\nother: 1\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String(String::new())));
+        assert_eq!(value.get("other"), Some(&Value::Int(1)));
+
+        let value = parse("script: |+\n  content\n\n\nother: 1\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String("content\n\n\n".to_string())));
+        assert_eq!(value.get("other"), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn block_scalar_ends_at_lower_indentation() {
+        let value = parse("script: |\n  line one\n  line two\nother: 1\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String("line one\nline two\n".to_string())));
+        assert_eq!(value.get("other"), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn empty_block_scalar_is_empty_string() {
+        let value = parse("script: |\nother: 1\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String(String::new())));
+        assert_eq!(value.get("other"), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn block_scalar_preserves_hash_and_indentation_inside_content() {
+        let value = parse("script: |\n  #!/bin/sh\n  echo hi # not a comment\n").unwrap();
+        assert_eq!(value.get("script"), Some(&Value::String("#!/bin/sh\necho hi # not a comment\n".to_string())));
+    }
+
+    #[test]
+    fn block_scalar_as_sequence_item() {
+        let input = "notes:\n  - |\n    line one\n    line two\n  - second\n";
+        let value = parse(input).unwrap();
+        let notes = value.get("notes").unwrap().as_sequence().unwrap();
+        assert_eq!(notes[0], Value::String("line one\nline two\n".to_string()));
+        assert_eq!(notes[1], Value::String("second".to_string()));
+    }
+
+    #[test]
+    fn block_scalar_nested_under_mapping_key() {
+        let input = "server:\n  motd: |\n    hello\n    world\n  port: 8080\n";
+        let value = parse(input).unwrap();
+        assert_eq!(value.path("server.motd"), Some(&Value::String("hello\nworld\n".to_string())));
+        assert_eq!(value.path("server.port"), Some(&Value::Int(8080)));
     }
 }
