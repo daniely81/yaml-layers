@@ -69,11 +69,17 @@ way to merge a list.
   in double-quoted strings and `''` as an escaped quote in single-quoted
   ones
 - `#` comments, both full-line and trailing (ignored inside quotes)
+- anchors and aliases: `defaults: &defaults` ... `server: *defaults` copies
+  the anchored value in place. An alias must refer to an anchor already
+  defined earlier in the document, the same restriction a single-pass
+  parser puts on itself. Anchoring an inline `- key: value` sequence item
+  (`- &x k: v`) is the one combination left unsupported - anchor the
+  mapping on its own indented block instead
 
 Not supported yet, and not silently mangled - unrecognized syntax is a
 parse error, not a guess:
 
-- anchors, aliases, and tags
+- tags (`!!str`, custom `!tag`)
 - multi-document streams (`---`)
 
 `Value` also implements `Display`, so `merged.to_string()` renders a

@@ -1,4 +1,5 @@
 use crate::value::Value;
+use std::collections::HashMap;
 use std::fmt;
 
 /// A parse failure, with the source line it happened on (1-based).
@@ -24,22 +25,22 @@ struct Line<'a> {
 
 /// Parses a restricted, deterministic subset of YAML: block mappings,
 /// block sequences, flow collections, quoted and unquoted scalars,
-/// `|` and `>` block scalars, and `#` comments.
+/// `|` and `>` block scalars, anchors and aliases, and `#` comments.
 ///
-/// Not supported yet: anchors and aliases, multi-document streams, and
-/// the explicit indentation indicator on a block scalar (`|2`) - the
-/// indentation is always inferred from the first content line instead.
-/// The top-level document must be a block mapping or a block sequence,
-/// since that covers every real config file this library has been used
-/// for.
+/// Not supported yet: multi-document streams, and the explicit
+/// indentation indicator on a block scalar (`|2`) - the indentation is
+/// always inferred from the first content line instead. The top-level
+/// document must be a block mapping or a block sequence, since that
+/// covers every real config file this library has been used for.
 pub fn parse(input: &str) -> Result<Value, ParseError> {
     let raw: Vec<&str> = input.lines().collect();
     let lines = preprocess(input);
     if lines.is_empty() {
         return Ok(Value::Null);
     }
+    let mut anchors: HashMap<String, Value> = HashMap::new();
     let top_indent = lines[0].indent;
-    let (value, next) = parse_block(&lines, 0, top_indent, &raw)?;
+    let (value, next) = parse_block(&lines, 0, top_indent, &raw, &mut anchors)?;
     if next != lines.len() {
         return Err(ParseError {
             line: lines[next].number,
@@ -88,19 +89,31 @@ fn is_sequence_item(content: &str) -> bool {
     content == "-" || content.starts_with("- ")
 }
 
-fn parse_block(lines: &[Line], pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
+fn parse_block(
+    lines: &[Line],
+    pos: usize,
+    indent: usize,
+    raw: &[&str],
+    anchors: &mut HashMap<String, Value>,
+) -> Result<(Value, usize), ParseError> {
     if pos >= lines.len() || lines[pos].indent != indent {
         let line = lines.get(pos).map(|l| l.number).unwrap_or_else(|| lines.last().map(|l| l.number).unwrap_or(1));
         return Err(ParseError { line, message: "expected content at this indentation".to_string() });
     }
     if is_sequence_item(lines[pos].content) {
-        parse_sequence(lines, pos, indent, raw)
+        parse_sequence(lines, pos, indent, raw, anchors)
     } else {
-        parse_mapping(lines, pos, indent, raw)
+        parse_mapping(lines, pos, indent, raw, anchors)
     }
 }
 
-fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
+fn parse_sequence(
+    lines: &[Line],
+    mut pos: usize,
+    indent: usize,
+    raw: &[&str],
+    anchors: &mut HashMap<String, Value>,
+) -> Result<(Value, usize), ParseError> {
     let mut items = Vec::new();
     while pos < lines.len() && lines[pos].indent == indent && is_sequence_item(lines[pos].content) {
         let content = lines[pos].content;
@@ -108,7 +121,7 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -
             let next_pos = pos + 1;
             if next_pos < lines.len() && lines[next_pos].indent > indent {
                 let child_indent = lines[next_pos].indent;
-                let (value, np) = parse_block(lines, next_pos, child_indent, raw)?;
+                let (value, np) = parse_block(lines, next_pos, child_indent, raw, anchors)?;
                 items.push(value);
                 pos = np;
             } else {
@@ -120,19 +133,52 @@ fn parse_sequence(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -
             let leading_spaces = after_dash.len() - after_dash.trim_start().len();
             let rest = &after_dash[leading_spaces..];
             let rest_indent = indent + 1 + leading_spaces;
-            if find_key_separator(rest).is_some() {
-                let (value, np) = parse_inline_mapping_item(lines, pos, rest, rest_indent, raw)?;
+            let (anchor, value_part) = extract_anchor(rest, lines[pos].number)?;
+            if let Some(alias_name) = value_part.strip_prefix('*') {
+                if anchor.is_some() {
+                    return Err(ParseError {
+                        line: lines[pos].number,
+                        message: "a sequence item cannot be both an anchor and an alias".to_string(),
+                    });
+                }
+                items.push(resolve_alias(anchors, alias_name.trim(), lines[pos].number)?);
+                pos += 1;
+            } else if find_key_separator(value_part).is_some() {
+                if anchor.is_some() {
+                    return Err(ParseError {
+                        line: lines[pos].number,
+                        message: "anchors on inline mapping sequence items are not supported".to_string(),
+                    });
+                }
+                let (value, np) = parse_inline_mapping_item(lines, pos, rest, rest_indent, raw, anchors)?;
                 items.push(value);
                 pos = np;
-            } else if let Some((style, chomp)) = parse_block_indicator(rest) {
+            } else if let Some((style, chomp)) = parse_block_indicator(value_part) {
                 let (text, last_line) = read_block_scalar(raw, lines[pos].number, indent, style, chomp);
-                items.push(Value::String(text));
+                let value = Value::String(text);
+                define_anchor(anchors, anchor, &value);
+                items.push(value);
                 pos += 1;
                 while pos < lines.len() && lines[pos].number <= last_line {
                     pos += 1;
                 }
+            } else if value_part.is_empty() {
+                let next_pos = pos + 1;
+                let value = if next_pos < lines.len() && lines[next_pos].indent > indent {
+                    let child_indent = lines[next_pos].indent;
+                    let (value, np) = parse_block(lines, next_pos, child_indent, raw, anchors)?;
+                    pos = np;
+                    value
+                } else {
+                    pos = next_pos;
+                    Value::Null
+                };
+                define_anchor(anchors, anchor, &value);
+                items.push(value);
             } else {
-                items.push(parse_scalar(rest, lines[pos].number)?);
+                let value = parse_scalar(value_part, lines[pos].number)?;
+                define_anchor(anchors, anchor, &value);
+                items.push(value);
                 pos += 1;
             }
         }
@@ -149,6 +195,7 @@ fn parse_inline_mapping_item(
     first_line_rest: &str,
     rest_indent: usize,
     raw: &[&str],
+    anchors: &mut HashMap<String, Value>,
 ) -> Result<(Value, usize), ParseError> {
     let mut end = pos + 1;
     while end < lines.len() && lines[end].indent >= rest_indent {
@@ -159,11 +206,17 @@ fn parse_inline_mapping_item(
     for l in &lines[pos + 1..end] {
         synthetic.push(Line { indent: l.indent, content: l.content, number: l.number });
     }
-    let (value, consumed) = parse_mapping(&synthetic, 0, rest_indent, raw)?;
+    let (value, consumed) = parse_mapping(&synthetic, 0, rest_indent, raw, anchors)?;
     Ok((value, pos + consumed))
 }
 
-fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) -> Result<(Value, usize), ParseError> {
+fn parse_mapping(
+    lines: &[Line],
+    mut pos: usize,
+    indent: usize,
+    raw: &[&str],
+    anchors: &mut HashMap<String, Value>,
+) -> Result<(Value, usize), ParseError> {
     let mut entries: Vec<(String, Value)> = Vec::new();
     while pos < lines.len() && lines[pos].indent == indent && !is_sequence_item(lines[pos].content) {
         let content = lines[pos].content;
@@ -173,30 +226,72 @@ fn parse_mapping(lines: &[Line], mut pos: usize, indent: usize, raw: &[&str]) ->
         })?;
         let key = parse_scalar_key(content[..separator].trim());
         let rest = content[separator + 1..].trim();
-        if let Some((style, chomp)) = parse_block_indicator(rest) {
+        let (anchor, rest) = extract_anchor(rest, lines[pos].number)?;
+        if let Some(alias_name) = rest.strip_prefix('*') {
+            let value = resolve_alias(anchors, alias_name.trim(), lines[pos].number)?;
+            entries.push((key, value));
+            pos += 1;
+        } else if let Some((style, chomp)) = parse_block_indicator(rest) {
             let (text, last_line) = read_block_scalar(raw, lines[pos].number, indent, style, chomp);
-            entries.push((key, Value::String(text)));
+            let value = Value::String(text);
+            define_anchor(anchors, anchor, &value);
+            entries.push((key, value));
             pos += 1;
             while pos < lines.len() && lines[pos].number <= last_line {
                 pos += 1;
             }
         } else if rest.is_empty() {
             let next_pos = pos + 1;
-            if next_pos < lines.len() && lines[next_pos].indent > indent {
+            let value = if next_pos < lines.len() && lines[next_pos].indent > indent {
                 let child_indent = lines[next_pos].indent;
-                let (value, np) = parse_block(lines, next_pos, child_indent, raw)?;
-                entries.push((key, value));
+                let (value, np) = parse_block(lines, next_pos, child_indent, raw, anchors)?;
                 pos = np;
+                value
             } else {
-                entries.push((key, Value::Null));
                 pos = next_pos;
-            }
+                Value::Null
+            };
+            define_anchor(anchors, anchor, &value);
+            entries.push((key, value));
         } else {
-            entries.push((key, parse_scalar(rest, lines[pos].number)?));
+            let value = parse_scalar(rest, lines[pos].number)?;
+            define_anchor(anchors, anchor, &value);
+            entries.push((key, value));
             pos += 1;
         }
     }
     Ok((Value::Mapping(entries), pos))
+}
+
+/// Splits a leading `&name` anchor off of `rest`, returning the anchor
+/// name (if present) and whatever follows it, trimmed. An anchor with no
+/// name (a bare `&` with nothing before the next space) is a parse error.
+fn extract_anchor<'a>(rest: &'a str, line: usize) -> Result<(Option<String>, &'a str), ParseError> {
+    match rest.strip_prefix('&') {
+        Some(after) => {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            if end == 0 {
+                return Err(ParseError { line, message: "expected an anchor name after '&'".to_string() });
+            }
+            Ok((Some(after[..end].to_string()), after[end..].trim_start()))
+        }
+        None => Ok((None, rest)),
+    }
+}
+
+/// Records `value` under `name` for later `*name` aliases, if this value
+/// was anchored at all.
+fn define_anchor(anchors: &mut HashMap<String, Value>, name: Option<String>, value: &Value) {
+    if let Some(name) = name {
+        anchors.insert(name, value.clone());
+    }
+}
+
+fn resolve_alias(anchors: &HashMap<String, Value>, name: &str, line: usize) -> Result<Value, ParseError> {
+    anchors
+        .get(name)
+        .cloned()
+        .ok_or_else(|| ParseError { line, message: format!("unknown anchor '*{}'", name) })
 }
 
 /// Finds the `:` that separates a mapping key from its value: one outside
@@ -852,5 +947,67 @@ mod tests {
         let value = parse(input).unwrap();
         assert_eq!(value.path("server.motd"), Some(&Value::String("hello\nworld\n".to_string())));
         assert_eq!(value.path("server.port"), Some(&Value::Int(8080)));
+    }
+
+    #[test]
+    fn alias_reuses_anchored_scalar() {
+        let value = parse("a: &x 5\nb: *x\n").unwrap();
+        assert_eq!(value.get("a"), Some(&Value::Int(5)));
+        assert_eq!(value.get("b"), Some(&Value::Int(5)));
+    }
+
+    #[test]
+    fn alias_reuses_anchored_mapping() {
+        let input = "defaults: &defaults\n  host: localhost\n  port: 8080\nserver: *defaults\n";
+        let value = parse(input).unwrap();
+        assert_eq!(value.path("server.host"), Some(&Value::String("localhost".to_string())));
+        assert_eq!(value.path("server.port"), Some(&Value::Int(8080)));
+    }
+
+    #[test]
+    fn alias_reuses_anchored_flow_collection() {
+        let value = parse("a: &pair [1, 2]\nb: *pair\n").unwrap();
+        assert_eq!(value.get("a"), value.get("b"));
+        assert_eq!(value.get("b").unwrap().as_sequence(), Some(&[Value::Int(1), Value::Int(2)][..]));
+    }
+
+    #[test]
+    fn alias_used_as_sequence_item() {
+        let input = "base: &base\n  role: worker\nworkers:\n  - *base\n  - *base\n";
+        let value = parse(input).unwrap();
+        let workers = value.get("workers").unwrap().as_sequence().unwrap();
+        assert_eq!(workers[0].get("role"), Some(&Value::String("worker".to_string())));
+        assert_eq!(workers[1].get("role"), Some(&Value::String("worker".to_string())));
+    }
+
+    #[test]
+    fn anchor_and_alias_on_sequence_scalar_items() {
+        let value = parse("tags:\n  - &t alpha\n  - *t\n").unwrap();
+        let tags = value.get("tags").unwrap().as_sequence().unwrap();
+        assert_eq!(tags, &[Value::String("alpha".to_string()), Value::String("alpha".to_string())]);
+    }
+
+    #[test]
+    fn later_anchor_overwrites_earlier_one_with_the_same_name() {
+        let value = parse("a: &x 1\nb: &x 2\nc: *x\n").unwrap();
+        assert_eq!(value.get("c"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn unknown_alias_is_an_error() {
+        let err = parse("a: *missing\n").unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn alias_cannot_reference_an_anchor_defined_later() {
+        let err = parse("a: *x\nb: &x 1\n").unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn anchor_without_a_name_is_an_error() {
+        let err = parse("a: & 1\n").unwrap_err();
+        assert_eq!(err.line, 1);
     }
 }
